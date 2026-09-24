@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+*.sif
+*.pt
+input/
+results/
+*.o[0-9]*
+*.e[0-9]*
+.venv/
