@@ -17,12 +17,13 @@ from pathlib import Path
 
 import ase.io
 from ase import Atoms
+from ase.data import chemical_symbols
 from ase.neighborlist import primitive_neighbor_list
 import numpy as np
 import torch
 from torch import nn
 
-FORMAT = "test40-phase-torus-v1"
+FORMAT = "test40-phase-torus-v2"
 PHASES = ("glass", "crystal")
 SI_MASS, O_MASS = 28.0855, 15.9994
 BEAD_MASS = SI_MASS + 2 * O_MASS
@@ -127,14 +128,33 @@ def prepare(args):
     out = output_dir(args.output)
     metadata = dict(format=FORMAT, phases={}, units="Angstrom", representation=args.representation)
     for phase in PHASES:
-        frames, seen, sources = [], set(), []
-        numbers, lengths, mapping = None, None, None
+        frames, cell_lengths, seen, sources = [], [], set(), []
+        numbers, mapping = None, None
+        # Each phase can come from a different pipeline (e.g. glass from a
+        # single-frame lammps-data quench, crystal from a lammps-dump-text
+        # MD trajectory), so format/type mapping is per-phase, not shared.
+        input_format = getattr(args, phase + "_input_format")
+        lammps_types = getattr(args, phase + "_lammps_types")
+        index = getattr(args, phase + "_index")
         for path in getattr(args, phase):
             sources.append(dict(name=path.name, sha256=digest(path)))
             options = {}
-            if args.input_format == "lammps-data" and args.lammps_types:
-                options["Z_of_type"] = dict(enumerate(args.lammps_types, 1))
-            for atoms in ase.io.iread(path, index=args.index, format=args.input_format, **options):
+            if lammps_types:
+                if input_format == "lammps-data":
+                    options["Z_of_type"] = dict(enumerate(lammps_types, 1))
+                elif input_format == "lammps-dump-text":
+                    # Dump files carry no mass/element info, only a bare
+                    # type id, so ASE needs the type-order species list
+                    # (specorder) instead of the Z_of_type mapping used for
+                    # lammps-data.
+                    options["specorder"] = [chemical_symbols[z] for z in lammps_types]
+            # ase.io.iread's streaming reader refuses a non-trivial slice
+            # start for chunk-scanned formats like lammps-dump-text (it
+            # only allows start 0 or -1); ase.io.read has no such
+            # restriction and the whole dataset is materialized in memory
+            # right after this anyway, so there is no streaming benefit lost.
+            result = ase.io.read(path, index=index, format=input_format, **options)
+            for atoms in result if isinstance(result, list) else [result]:
                 atoms = atoms.repeat(getattr(args, "repeat_" + phase))
                 if not atoms.pbc.all():
                     raise ValueError(f"{path}: three periodic directions required")
@@ -143,20 +163,21 @@ def prepare(args):
                 if set(z) != {8, 14} or np.sum(z == 8) != 2 * np.sum(z == 14):
                     raise ValueError(f"{path}: expected Si:O = 1:2 (atomic numbers 14 and 8)")
                 if numbers is None:
-                    numbers, lengths = z.copy(), cell.copy()
-                if not np.array_equal(z, numbers) or not np.allclose(cell, lengths, atol=1e-5):
-                    raise ValueError(f"{phase}: all frames must have the same atom order and cell")
-                pos = np.asarray(atoms.get_positions() % lengths, dtype=np.float32)
+                    numbers = z.copy()
+                if not np.array_equal(z, numbers):
+                    raise ValueError(f"{phase}: all frames must have the same atom order")
+                pos = np.asarray(atoms.get_positions() % cell, dtype=np.float32)
                 if not np.isfinite(pos).all():
                     raise ValueError("Non-finite coordinates")
                 if args.representation == "tetrahedron":
                     pos, sites = tetrahedral_mapping(atoms, args.mapping_cutoff, args.allow_sharing_defects)
                     if mapping is not None and sites != mapping:
-                        raise ValueError(f"{phase}: Si-O topology changed between frames; this fixed-topology mapping cannot represent bond exchange")
+                        raise ValueError(f"{phase}: Si-O topology changed between frames; this fixed-topology mapping cannot represent bond exchange (independently generated replicas, e.g. separately quenched glasses, have different networks and cannot be pooled here)")
                     mapping = sites
                 key = hashlib.sha256(pos.tobytes()).hexdigest()
                 if key not in seen:
                     frames.append(pos)
+                    cell_lengths.append(cell)
                     seen.add(key)
         if not frames:
             raise ValueError(f"No frames for {phase}")
@@ -174,7 +195,11 @@ def prepare(args):
             mode = "ordered held-out tail; correlation depends on supplied frame spacing"
         np.save(out / f"{phase}.npy", np.stack(frames))
         output_numbers = [14] * len(mapping) if mapping is not None else numbers.tolist()
-        metadata["phases"][phase] = dict(numbers=output_numbers, lengths=lengths.tolist(),
+        # One cell per frame (e.g. NPT "cell breathing"): the model already
+        # takes box lengths as per-call conditioning, so training/generation
+        # look these up per frame instead of assuming one fixed phase cell.
+        metadata["phases"][phase] = dict(numbers=output_numbers,
+            lengths=[c.tolist() for c in cell_lengths],
             train_ids=train_ids, valid_ids=valid_ids, validation_mode=mode,
             frames=len(frames), sha256=digest(out / f"{phase}.npy"), sources=sources,
             representation=args.representation, source_numbers=numbers.tolist(), mapping=mapping,
@@ -304,9 +329,9 @@ def train(args):
     device = device_for(args.device)
     config = dict(width=args.width, layers=args.layers, cutoff=args.cutoff)
     for info in meta["phases"].values():
-        if args.cutoff >= min(info["lengths"]) / 2:
-            raise ValueError("Replicate input cells or reduce cutoff to below half the shortest side")
-    maximum = max(max(p["lengths"]) for p in meta["phases"].values())
+        if args.cutoff >= min(min(cell) for cell in info["lengths"]) / 2:
+            raise ValueError("Replicate input cells or reduce cutoff to below half the shortest side, in every frame")
+    maximum = max(max(cell) for p in meta["phases"].values() for cell in p["lengths"])
     sigma_max = args.sigma_max or maximum
     if sigma_max <= args.sigma_min or math.exp(-2 * math.pi**2 * (sigma_max / maximum)**2) > 1e-5:
         raise ValueError("sigma-max must exceed sigma-min and be large enough for a uniform terminal distribution")
@@ -339,11 +364,12 @@ def train(args):
 
     def loss_for(phase, frame, sigma):
         info = meta["phases"][phase]
+        lengths = info["lengths"][frame]
         clean = torch.tensor(np.array(arrays[phase][frame]), device=device)
-        box = clean.new_tensor(info["lengths"])
+        box = clean.new_tensor(lengths)
         noisy = (clean + sigma * torch.randn_like(clean)) % box
         types = torch.tensor(np.asarray(info["numbers"]) == 14, device=device).long()
-        pred = model(types, graph(noisy, info["lengths"], args.cutoff), PHASES.index(phase), sigma, info["lengths"])
+        pred = model(types, graph(noisy, lengths, args.cutoff), PHASES.index(phase), sigma, lengths)
         target = wrapped_target(noisy, clean, box, sigma)
         return (pred - target).square().mean(), target.square().mean()
 
@@ -400,11 +426,17 @@ def generate(args):
     model.load_state_dict(ck["model"])
     model.eval()
     info = ck["metadata"]["phases"][args.phase]
-    box = torch.tensor(info["lengths"], dtype=torch.float32, device=device)
+    # A generated trajectory needs one fixed target cell; with per-frame
+    # lengths (e.g. NPT "cell breathing" in the source MD) that means picking
+    # one reference frame. Default to the first training frame; --frame
+    # overrides. The choice is recorded in settings/generation.json below.
+    cell_frame = args.frame if args.frame is not None else info["train_ids"][0]
+    lengths = info["lengths"][cell_frame]
+    box = torch.tensor(lengths, dtype=torch.float32, device=device)
     types = torch.tensor(np.asarray(info["numbers"]) == 14, device=device).long()
     levels = np.geomspace(ck["settings"]["sigma_max"], ck["settings"]["sigma_min"], args.steps + 1)
     settings = dict(checkpoint_sha256=digest(args.checkpoint), phase=args.phase, steps=args.steps,
-                    seed=args.seed, device=args.device, init="uniform_periodic")
+                    seed=args.seed, device=args.device, init="uniform_periodic", cell_frame=cell_frame)
     out = output_dir(args.output, args.resume)
     completed = 0
     if args.resume:
@@ -428,7 +460,7 @@ def generate(args):
         save_pt(out / "restart.pt", dict(settings=settings, positions=pos.cpu(), step=completed, rng=rng_state()))
         save_json(out / "generation.json", dict(format=FORMAT, settings=settings, step=completed,
             valid_frames=completed + 1, complete=completed == args.steps, numbers=info["numbers"],
-            lengths=info["lengths"], is_equilibrium_trajectory=False))
+            lengths=lengths, is_equilibrium_trajectory=False))
 
     for step in range(completed, args.steps):
         if STOP or time.monotonic() >= until:
@@ -436,8 +468,8 @@ def generate(args):
             return 75
         sigma = float(levels[step])
         dv = float(levels[step]**2 - levels[step + 1]**2)
-        pred = model(types, graph(pos, info["lengths"], config["cutoff"]),
-                     PHASES.index(args.phase), sigma, info["lengths"])
+        pred = model(types, graph(pos, lengths, config["cutoff"]),
+                     PHASES.index(args.phase), sigma, lengths)
         # Euler reverse VE-SDE: score = -prediction/sigma; diffusion sqrt(delta variance).
         pos = (pos - dv / sigma * pred + math.sqrt(dv) * torch.randn_like(pos)) % box
         if not torch.isfinite(pos).all():
@@ -449,7 +481,7 @@ def generate(args):
             print(f"{args.phase}: {completed}/{args.steps}, sigma={sigma:.4g}", flush=True)
     save()
     # No repeated zero-noise polishing: final sample retains sigma_min smoothing.
-    atoms = Atoms(numbers=info["numbers"], positions=pos.cpu().numpy(), cell=np.diag(info["lengths"]), pbc=True)
+    atoms = Atoms(numbers=info["numbers"], positions=pos.cpu().numpy(), cell=np.diag(lengths), pbc=True)
     if info["representation"] == "tetrahedron":
         atoms.set_masses(info["bead_masses_amu"])
     atoms.info.update(phase_condition=args.phase, sigma_min_A=ck["settings"]["sigma_min"],
@@ -462,7 +494,7 @@ def generate(args):
         with (out / "final.data").open("w") as stream:
             stream.write("test40 SiO4 CG positions; structure generator, no force field supplied\n\n")
             stream.write(f"{len(atoms)} atoms\n{len(unique)} atom types\n\n")
-            for side, axis in zip(info["lengths"], "xyz"):
+            for side, axis in zip(lengths, "xyz"):
                 stream.write(f"0 {side:.12g} {axis}lo {axis}hi\n")
             stream.write("\nMasses\n\n")
             for k, mass in enumerate(unique, 1):
@@ -552,13 +584,19 @@ def evaluate(args):
     arrays, meta = load_dataset(args.dataset)
     info = meta["phases"][args.phase]
     sample = ase.io.read(args.sample)
-    if not sample.pbc.all() or sorted(sample.numbers) != sorted(info["numbers"]) or not np.allclose(lengths_of(sample.cell), info["lengths"]):
+    all_lengths = np.asarray(info["lengths"])
+    sample_lengths = lengths_of(sample.cell)
+    # Frames may each have their own cell (e.g. NPT "cell breathing"), so
+    # check the sample cell falls within the observed per-axis range instead
+    # of requiring exact equality to one fixed phase-wide cell.
+    in_range = np.all((sample_lengths >= all_lengths.min(0) - 1e-5) & (sample_lengths <= all_lengths.max(0) + 1e-5))
+    if not sample.pbc.all() or sorted(sample.numbers) != sorted(info["numbers"]) or not in_range:
         raise ValueError("Sample composition/cell must match the selected phase dataset")
     is_cg = info["representation"] == "tetrahedron"
     stats = cg_stats if is_cg else structural_stats
     cutoff = args.bond_cutoff or (4.0 if is_cg else 2.2)
     refs = [stats(Atoms(numbers=info["numbers"], positions=arrays[args.phase][i],
-        cell=np.diag(info["lengths"]), pbc=True), cutoff) for i in info["valid_ids"][:args.reference_frames]]
+        cell=np.diag(info["lengths"][i]), pbc=True), cutoff) for i in info["valid_ids"][:args.reference_frames]]
     report = dict(phase=args.phase, validation_mode=info["validation_mode"],
                   representation=info["representation"], sample=stats(sample, cutoff), references=refs,
                   note="No automatic scientific pass/fail. Compare coordination, RDF and reciprocal peaks across independent samples.")
@@ -577,7 +615,7 @@ def evaluate(args):
         axes[0].plot([], [], color="C0", label="reference")
         axes[0].set(xlabel="Bead distance (Angstrom)", ylabel="g(r)")
         axes[0].legend()
-        wave = 2 * np.pi * np.asarray(refs[0]["reciprocal_indices"]) / np.asarray(info["lengths"])
+        wave = 2 * np.pi * np.asarray(refs[0]["reciprocal_indices"]) / sample_lengths
         magnitude = np.linalg.norm(wave, axis=1)
         axes[1].scatter(magnitude, np.mean([r["structure_factor"] for r in refs], axis=0), s=8, alpha=.4, label="reference")
         axes[1].scatter(magnitude, report["sample"]["structure_factor"], s=8, alpha=.4, label="generated")
@@ -611,9 +649,12 @@ def parser():
     for phase in PHASES:
         prep.add_argument("--" + phase, type=Path, nargs="+", required=True)
         prep.add_argument("--repeat-" + phase, type=count, nargs=3, default=(1, 1, 1))
-    prep.add_argument("--input-format", default=None, help="ASE format, e.g. lammps-data or extxyz")
-    prep.add_argument("--lammps-types", type=int, nargs="+", help="Atomic numbers for LAMMPS types 1,2,...")
-    prep.add_argument("--index", default=":", help="ASE frame slice, e.g. ::10")
+        prep.add_argument("--" + phase + "-input-format", dest=phase + "_input_format", default=None,
+                           help="ASE format for --" + phase + ", e.g. lammps-data or lammps-dump-text; auto-detected if omitted")
+        prep.add_argument("--" + phase + "-lammps-types", dest=phase + "_lammps_types", type=int, nargs="+",
+                           help="Atomic numbers for LAMMPS types 1,2,... in --" + phase)
+        prep.add_argument("--" + phase + "-index", dest=phase + "_index", default=":",
+                           help="ASE frame slice for --" + phase + ", e.g. ::10 (per-phase: a single-frame quench and a long trajectory usually need different slices)")
     prep.add_argument("--validation-fraction", type=positive, default=0.1)
     prep.add_argument("--split-gap", type=int, default=0, help="Discard this many frames before held-out tail")
     prep.add_argument("--allow-single-reference", action="store_true")
@@ -635,6 +676,7 @@ def parser():
     gen.add_argument("--checkpoint", type=Path, required=True)
     gen.add_argument("--phase", choices=PHASES, required=True)
     gen.add_argument("--steps", type=count, default=1000)
+    gen.add_argument("--frame", type=int, help="Dataset frame index to use as the fixed generation cell; default is the first training frame")
     for q in (tr, gen):
         q.add_argument("--output", type=Path, required=True)
         q.add_argument("--device", choices=("cpu", "cuda"), default="cuda")

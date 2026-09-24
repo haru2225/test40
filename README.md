@@ -69,6 +69,9 @@ qsub -P <課題番号> -v STAGE=generate,PHASE=crystal,RESUME=1 run_test40.pbs
 # 独立したサンプル
 qsub -P <課題番号> -v STAGE=generate,PHASE=glass,SEED=2026 run_test40.pbs
 
+# 複数フレーム(セルが違いうる)データセットで、特定フレームのセルへ生成する
+qsub -P <課題番号> -v STAGE=generate,PHASE=crystal,FRAME=2 run_test40.pbs
+
 # 自分のデータで学習を開始（新しい出力先を使う）
 qsub -P <課題番号> -v DATASET_PATH=/absolute/path/dataset,TRAIN_DIR=/absolute/path/train run_test40.pbs
 ```
@@ -83,34 +86,61 @@ CPUでは乱数状態を含む再開一致をテスト済みです。CUDAのscat
 ## 自分の全原子データからSiO₄ビーズを作る
 
 固定直交セルの全原子 `extxyz` 軌跡を推奨します。座標・セルはÅ、元素はSi/O、PBCは3方向です。
-LAMMPS dataも読み込めます。セルサイズが違うフレームを混ぜると拒否します。
+LAMMPS dataも読み込めます。`--glass`/`--crystal` はそれぞれ複数ファイルを取れます。
+
+各フレームは自分自身のセル長を保持します（NPTの「セル呼吸」があるMDトラジェクトリでもそのまま使えます）。
+学習・生成はフレームごとのセル長をモデルへの条件入力として使います。ただし**Si-O結合トポロジー（どのOがどのSiに属すか）は
+相ごとに全フレームで完全一致している必要があります**——結合交換は表現できません。これは、独立に別々にクエンチした
+複数のガラス構造（ネットワークがサンプルごとに異なる）を「複数フレーム」として束ねることはできない、という意味でもあります。
+複数フレームが必要な場合は、同じ構造を追跡した1本の軌跡（時間的にデコリレートした複数スナップショット）を使ってください。
 
 ```bash
 singularity exec --bind "$PWD:$PWD" test40.sif python test40.py prepare \
   --glass input/glass.extxyz --crystal input/crystal.extxyz \
-  --index ::10 --split-gap 5 --output input/dataset
+  --glass-index ::10 --crystal-index ::10 --split-gap 5 --output input/dataset
 ```
 
-フレームの末尾10%を検証用に取り分け、`--split-gap` で境界のフレームを間引けます。
-近接フレームの時間相関は残るので、十分な時間間隔や独立した軌跡を用意してください。
+`--glass-index`/`--crystal-index` は相ごとに指定します（例: 1構造だけのクエンチ結果と、長いMD軌跡を同じ`prepare`呼び出しで
+混ぜる場合、必要なスライスが相ごとに異なるため）。フレームの末尾10%を検証用に取り分け、`--split-gap` で境界のフレームを
+間引けます。近接フレームの時間相関は残るので、十分な時間間隔や独立した軌跡を用意してください。
 同じ座標の重複フレームは取り除きます。1構造しかない相は、`--allow-single-reference` を明示した場合だけ受け付けます。
 `--repeat-glass 2 2 2` / `--repeat-crystal 2 2 2` で全原子構造を複製してからマッピングできます。
-学習cutoffは最短セル辺の半分より小さくしてください。既定は5 Åです。
+学習cutoffは、全フレームを通して最短セル辺の半分より小さくしてください。既定は5 Åです。
 
 手元のtest32/test33参照と同じファイルから作る例（入力はリポジトリ外の既存ファイル）：
 
 ```bash
 python test40.py prepare \
   --glass ../DM2/demo/demo_training/simu_data/sio2_3000_glass_0_1k_sample0.dat \
+  --glass-input-format lammps-data --allow-single-reference --allow-sharing-defects \
   --crystal ../ScoreMD/md/silica_beta_cristobalite_init.data \
-  --input-format lammps-data --allow-single-reference --allow-sharing-defects \
+  --crystal-input-format lammps-data \
   --output input/reference
 ```
 
-LAMMPSの原子種番号はMassesからASEが推定します。Massesがない場合は `--lammps-types 14 8` のように指定できますが、
-同じコマンドで読む全ファイルのtype順序が同じ場合に限ります。元のガラスと結晶はtype順序が逆なので、上の例では指定しません。
+LAMMPSの原子種番号はMassesからASEが推定します。Massesがない場合は `--glass-lammps-types 14 8` のように相ごとに
+指定できます（`lammps-data`ではMassesからの自動推定に対して`Z_of_type`優先の上書き、`lammps-dump-text`のようにMassesを
+持たない形式では必須です）。元のガラスと結晶はtype順序が逆（ガラス: 1=O, 2=Si／結晶: 1=Si, 2=O）なので、
+相ごとに別々の`--glass-lammps-types`/`--crystal-lammps-types`を使います。
 四面体マッピングに失敗した場合は原子種・距離・参照の配位欠陥を確認してください。
 `--mapping-cutoff` で距離を変更できますが、単に検査を通すために広げるのは適切ではありません。
+
+`md/silica_beta_cristobalite.in`（NPT、結晶）のような固定トポロジーMD軌跡を`lammps-dump-text`として複数フレーム
+取り込む例（同じ物質でも相ごとに条件が違うことが多いため`--crystal-*`だけを軌跡用に指定）：
+
+```bash
+python test40.py prepare \
+  --glass ../DM2/demo/demo_training/simu_data/sio2_3000_glass_0_1k_sample0.dat \
+  --glass-input-format lammps-data --allow-single-reference --allow-sharing-defects \
+  --crystal ../ScoreMD/md/traj_0.lammpstrj ../ScoreMD/md/traj_1.lammpstrj \
+  --crystal-input-format lammps-dump-text --crystal-lammps-types 14 8 \
+  --crystal-index 1000::300 --split-gap 2 \
+  --output input/reference
+```
+
+ガラス側で同様に独立フレームを増やすには、既存の`md/silica_beta_cristobalite.in`と同じ考え方の
+`md/silica_glass_nvt.in`（新規）でNVT軌跡を生成してください——独立にクエンチした複数のガラス構造を直接束ねることは
+できません（上記のトポロジー制約）。
 
 ## 結果と評価
 

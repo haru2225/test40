@@ -33,6 +33,10 @@ case "$stage" in
         args=(generate --checkpoint "${CHECKPOINT_PATH:-$train_dir/checkpoint.pt}"
               --phase "$phase" --steps "${STEPS:-1000}"
               --output "${GENERATED_DIR:-$work_dir/results/$phase-seed${SEED:-1337}}")
+        # With multi-frame datasets, each frame can carry its own cell (e.g.
+        # NPT "cell breathing"); FRAME picks which one to generate into.
+        # Default: the first training frame.
+        if [[ -n "${FRAME:-}" ]]; then args+=(--frame "$FRAME"); fi
         ;;
     *) echo 'STAGE must be train or generate' >&2; exit 2 ;;
 esac

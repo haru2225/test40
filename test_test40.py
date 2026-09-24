@@ -187,6 +187,82 @@ def test_train_generate_resume_and_evaluate(tmp_path):
     assert result["bonds_A"]["mean"] == pytest.approx(1.62)
 
 
+def test_variable_cell_frames(tmp_path):
+    # Frames of one phase may each carry their own cell (e.g. NPT "cell
+    # breathing" in the source MD): prepare must keep a per-frame cell
+    # instead of requiring one fixed phase-wide cell, and train/generate
+    # must use the right one.
+    crystal = corner_sharing_crystal()
+    cell0 = np.array(crystal.cell)
+    rng = np.random.default_rng(11)
+    paths = []
+    for phase in t.PHASES:
+        frames = []
+        for scale in (1.00, 1.02, 1.04):
+            a = crystal.copy()
+            a.set_cell(cell0 * scale, scale_atoms=True)
+            a.positions += rng.normal(0, .01, a.positions.shape)
+            frames.append(a)
+        path = tmp_path / f"{phase}.extxyz"
+        ase.io.write(path, frames)
+        paths.append(path)
+    data = tmp_path / "cg"
+    t.prepare(t.parser().parse_args(["prepare", "--glass", str(paths[0]), "--crystal", str(paths[1]),
+                                     "--output", str(data)]))
+    arrays, meta = t.load_dataset(data)
+    lengths = np.array(meta["phases"]["glass"]["lengths"])
+    assert lengths.shape == (3, 3)
+    assert len(set(lengths[:, 0].round(6))) == 3
+    out = tmp_path / "train"
+    t.train(t.parser().parse_args(["train", "--dataset", str(data), "--output", str(out), "--device", "cpu",
+                                   "--width", "8", "--layers", "2", "--updates", "2"]))
+    for phase in t.PHASES:
+        default_frame = meta["phases"][phase]["train_ids"][0]
+        for frame_id, expect in ((None, default_frame), (2, 2)):
+            generated = tmp_path / f"{phase}-{frame_id}"
+            args = ["generate", "--checkpoint", str(out / "checkpoint.pt"), "--phase", phase,
+                    "--output", str(generated), "--device", "cpu", "--steps", "3"]
+            if frame_id is not None:
+                args += ["--frame", str(frame_id)]
+            t.generate(t.parser().parse_args(args))
+            gen_meta = json.loads((generated / "generation.json").read_text())
+            assert gen_meta["settings"]["cell_frame"] == expect
+            expected_lengths = meta["phases"][phase]["lengths"][expect]
+            np.testing.assert_allclose(gen_meta["lengths"], expected_lengths)
+            final = ase.io.read(generated / "final.extxyz")
+            np.testing.assert_allclose(np.diag(np.array(final.cell)), expected_lengths, atol=1e-4)
+        report = tmp_path / f"cg-{phase}.json"
+        t.evaluate(t.parser().parse_args(["evaluate", "--dataset", str(data), "--phase", phase,
+            "--sample", str((tmp_path / f"{phase}-None") / "final.extxyz"), "--output", str(report)]))
+        assert report.with_suffix(".png").exists()
+
+
+def test_reject_topology_mismatch_between_frames(tmp_path):
+    # Independently generated replicas (e.g. separately quenched glasses)
+    # generally bond O to different Si than one another. Swapping two
+    # oxygens that belong to different Si mimics that: each frame is still
+    # individually a valid four-O/two-Si mapping, but the frame-to-frame
+    # bead identity is inconsistent and must be rejected, not silently
+    # pooled.
+    crystal = corner_sharing_crystal()
+    _, sites = t.tetrahedral_mapping(crystal)
+    o_a = sites[0]["oxygen_indices"][0]
+    other_site = next(s for s in sites[1:] if o_a not in s["oxygen_indices"])
+    o_b = other_site["oxygen_indices"][0]
+    swapped = crystal.copy()
+    swapped.positions[[o_a, o_b]] = swapped.positions[[o_b, o_a]]
+    _, swapped_sites = t.tetrahedral_mapping(swapped)
+    assert swapped_sites != sites
+    glass_path = tmp_path / "glass.extxyz"
+    ase.io.write(glass_path, [crystal, swapped])
+    crystal_path = tmp_path / "crystal.extxyz"
+    ase.io.write(crystal_path, [crystal, crystal.copy()])
+    args = t.parser().parse_args(["prepare", "--glass", str(glass_path), "--crystal", str(crystal_path),
+                                  "--output", str(tmp_path / "bad")])
+    with pytest.raises(ValueError, match="topology changed"):
+        t.prepare(args)
+
+
 def test_reject_duplicate_only_validation(tmp_path):
     data, atoms = dataset(tmp_path)
     path = tmp_path / "same.extxyz"
