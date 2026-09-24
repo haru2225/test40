@@ -69,8 +69,12 @@ qsub -P <課題番号> -v STAGE=prepare run_test40.pbs
 # まず短いGPU動作確認（同梱の examples/reference を使う）。生成品質の検証ではありません。
 qsub -P <課題番号> -v STAGE=train,DATASET_PATH=$PWD/examples/reference,UPDATES=20,LOG_EVERY=10,CHECKPOINT_EVERY=10 run_test40.pbs
 
+# 検証済みの複数フレームデータセット(glass 11フレーム・crystal 62フレーム)で本番学習
+# (MD生成不要、STAGE=trainだけでよい: STAGE=fullのMD生成/prepareを経由しない)
+qsub -P <課題番号> -v STAGE=train,DATASET_PATH=$PWD/examples/dm2-glass-crystal run_test40.pbs
+
 # 同じ学習を3万更新まで継続
-qsub -P <課題番号> -v RESUME=1,UPDATES=30000 run_test40.pbs
+qsub -P <課題番号> -v RESUME=1,DATASET_PATH=$PWD/examples/dm2-glass-crystal,UPDATES=30000 run_test40.pbs
 
 # 学習ジョブが完了してから、それぞれ別ジョブで生成
 qsub -P <課題番号> -v STAGE=generate,PHASE=glass run_test40.pbs
@@ -243,5 +247,24 @@ python -m pytest -q
 - `md/glass_seed.dat`: [DM2](https://github.com/digital-synthesis-lab/DM2), commit
   `ab5a7e65d0879c5de23859fa191e318f9f70fae0`, `demo/demo_training/simu_data/sio2_3000_glass_100k_sample0.dat`
   （NVT軌跡の開始構造1つ、`examples/reference`の同梱ガラスとは別サンプル）。`licenses/DM2-MIT.txt`。
+
+**`md/silica_glass_nvt.in`は未検証です。** 平衡化1500〜2000ステップ（既定の20000ステップより大幅に短縮）で
+試したところ、生成された全フレームでSiO4マッピングが失敗しました（Si配位数異常）。平衡化不足が原因の可能性が
+高いですが、既定の20000ステップで直るかは未確認です。`STAGE=full`/`md`での自動glass生成は現時点では
+信頼できません。多フレームのglassデータが必要な場合は、下記`examples/dm2-glass-crystal/`のように
+DM2の独立クエンチ構造を`--allow-topology-drift`で束ねる方法を使ってください。
+
+### `examples/dm2-glass-crystal/`（検証済みの複数フレームデータセット）
+
+glass 11フレーム・crystal 62フレームの、実際に動作確認したデータセットです。`--dataset examples/dm2-glass-crystal`
+でそのまま学習に使えます。
+
+- Glass: [DM2](https://github.com/digital-synthesis-lab/DM2), commit `ab5a7e65d0879c5de23859fa191e318f9f70fae0`の
+  `demo/demo_training/simu_data/sio2_3000_glass_{0_1k,1k,10k,100k}_sample{N}.dat`のうち、Si配位数が正常な11個
+  （独立にクエンチされた構造なのでSi-O結合網はサンプルごとに異なる。`--allow-topology-drift`で許容し、
+  `prepare --glass-input-format lammps-data --allow-sharing-defects --allow-topology-drift`で作成）。
+  `licenses/DM2-MIT.txt`。
+- Crystal: ユーザーのScoreMD作業ツリーの`md/traj_0.lammpstrj`・`traj_1.lammpstrj`（β-cristobalite NPT軌跡）から
+  `--crystal-index 1000::300 --split-gap 2`で抽出。`licenses/ScoreMD-MIT.txt`。
 
 再配布時にもこれらのnoticeを保持してください。
