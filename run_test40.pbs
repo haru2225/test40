@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #PBS -q sg8
 #PBS -N test40_sio2
-#PBS -l walltime=48:00:00
+#PBS -l walltime=20:00:00
 #PBS -l select=1:ncpus=8:mpiprocs=1:ompthreads=8:mem=32gb:ngpus=1
 #PBS -j oe
 set -euo pipefail
@@ -127,7 +127,7 @@ esac
 # being walltime-killed mid-write). Keep WALLTIME_HOURS in sync with the
 # walltime header if you change it (or override with -l walltime=... on
 # qsub, which does not update this variable).
-walltime_hours="${WALLTIME_HOURS:-48}"
+walltime_hours="${WALLTIME_HOURS:-20}"
 default_budget=$(awk -v w="$walltime_hours" -v s="$SECONDS" \
     'BEGIN { b = w - s / 3600 - 0.5; if (b < 0.1) b = 0.1; printf "%.2f", b }')
 args+=(--device cuda --seed "${SEED:-1337}" --checkpoint-every "${CHECKPOINT_EVERY:-100}"

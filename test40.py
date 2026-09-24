@@ -171,8 +171,16 @@ def prepare(args):
                     raise ValueError("Non-finite coordinates")
                 if args.representation == "tetrahedron":
                     pos, sites = tetrahedral_mapping(atoms, args.mapping_cutoff, args.allow_sharing_defects)
-                    if mapping is not None and sites != mapping:
-                        raise ValueError(f"{phase}: Si-O topology changed between frames; this fixed-topology mapping cannot represent bond exchange (independently generated replicas, e.g. separately quenched glasses, have different networks and cannot be pooled here)")
+                    if mapping is not None and sites != mapping and not args.allow_topology_drift:
+                        raise ValueError(f"{phase}: Si-O topology changed between frames; this fixed-topology mapping cannot represent bond exchange (independently generated replicas, e.g. separately quenched glasses, have different networks; pass --allow-topology-drift if that is intentional)")
+                    # Each frame's own bead positions (pos) are always computed
+                    # fresh above from that frame's own topology, so training
+                    # is unaffected by drift: bead i always is Si atom i's
+                    # tetrahedron in whichever frame it is drawn from. Only
+                    # the single stored mapping/bead_masses_amu (used for
+                    # generate()'s output masses, not for training) reflects
+                    # the LAST frame seen rather than being exactly right for
+                    # every frame when --allow-topology-drift is set.
                     mapping = sites
                 key = hashlib.sha256(pos.tobytes()).hexdigest()
                 if key not in seen:
@@ -661,6 +669,7 @@ def parser():
     prep.add_argument("--representation", choices=("tetrahedron", "atomic"), default="tetrahedron")
     prep.add_argument("--mapping-cutoff", type=positive, default=2.2, help="Si-O distance defining shared SiO4 tetrahedra, Angstrom")
     prep.add_argument("--allow-sharing-defects", action="store_true", help="Allow O shared by 1 or >2 tetrahedra; divide its mass by actual sharing count. Si still must have four O.")
+    prep.add_argument("--allow-topology-drift", action="store_true", help="Allow frames whose Si-O connectivity differs (e.g. independently quenched glass replicas). Training is unaffected (each frame's beads are computed from its own topology); only the single stored bead_masses_amu (generate()'s output masses) reflects one frame, not every frame exactly.")
     prep.add_argument("--output", type=Path, required=True)
     tr = sub.add_parser("train")
     tr.add_argument("--dataset", type=Path, required=True)
