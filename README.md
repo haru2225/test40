@@ -5,8 +5,10 @@
 そのビーズ配置を学習します。生成は指定相の周期セル内の一様ランダム配置から開始します。
 
 学習済み・品質検証済みのモデルではなく、スパコンで学習・評価するための実装です。
-同梱の参照はガラス1構造・結晶1構造の**動作確認用データ**です。このデータでの検証lossは
-独立な構造への汎化を測りません。多数の独立な参照構造を使った評価が必要です。
+`examples/reference/`はガラス1構造・結晶1構造の**動作確認用データ**です。このデータでの検証lossは
+独立な構造への汎化を測りません。既定の`qsub run_test40.pbs`（`STAGE=full`）は、同梱のLAMMPS入力
+から結晶(NPT複数レプリカ)・ガラス(NVT複数レプリカ)の多フレーム軌跡を生成して`input/dataset`を
+作りますが、それでも汎化性能の保証にはなりません。多数の独立な参照構造を使った評価が必要です。
 
 ## 粗視化の定義
 
@@ -34,7 +36,9 @@ R_i=r_{Si,i}+\frac{\sum_o(m_O/n_o)\,\Delta r_{i,o}}{M_i}.
 ## スパコンで使う
 
 Python 3.11、PyTorch 2.6.0 / CUDA 12.4を基準にしています。PBSの既定値は既存の `sg8`、
-GPU 1台、CPU 8、メモリ32 GB、20時間です。必要なモジュールは利用環境に合わせてロードしてください。
+GPU 1台、CPU 8、メモリ32 GB、48時間です（`STAGE=full`がMD生成を含むため；`STAGE=train`のみで
+使う場合は`qsub -l walltime=20:00:00 ...`のように短縮できます）。
+必要なモジュールは利用環境に合わせてロードしてください。
 コンテナ作成は外部ネットワークに接続でき、Singularity/Apptainerのビルドを許可されたホストで実行します。
 
 ```bash
@@ -43,8 +47,23 @@ cd test40
 singularity build test40.sif Singularity.def
 # Apptainerでも可: apptainer build test40.sif Singularity.def
 
-# まず短いGPU動作確認。これは生成品質の検証ではありません。
-qsub -P <課題番号> -v UPDATES=20,LOG_EVERY=10,CHECKPOINT_EVERY=10 run_test40.pbs
+# 既定(STAGE=full)は1回のqsubで完結: 同梱のLAMMPS入力(md/*.in, md/glass_seed.dat)から
+# 結晶(NPT)・ガラス(NVT)の多フレーム軌跡を生成し(足りないレプリカのみ; 既にあればスキップ)、
+# input/dataset へprepareし、学習まで行います。LAMMPS(Vashishta potential)は
+# コンテナの外で動くので、run_test40.pbs内の「site-specific」ブロックで
+# 自サイトのLAMMPSモジュール名に書き換え、LAMMPS_POTENTIALSも指定してください。
+qsub -P <課題番号> -v LAMMPS_POTENTIALS=/path/to/vashishta/potentials run_test40.pbs
+
+# 段階を分けたい場合はSTAGEで指定できます:
+#   STAGE=md      同梱LAMMPS入力から軌跡だけ生成（コンテナ不要）
+#   STAGE=prepare 既存の軌跡からinput/datasetをprepareするだけ
+#   STAGE=train   既存のinput/dataset（既定）で学習だけ
+#   STAGE=generate 生成のみ（下記）
+qsub -P <課題番号> -v STAGE=md,LAMMPS_POTENTIALS=/path/to/vashishta/potentials run_test40.pbs
+qsub -P <課題番号> -v STAGE=prepare run_test40.pbs
+
+# まず短いGPU動作確認（同梱の examples/reference を使う）。生成品質の検証ではありません。
+qsub -P <課題番号> -v STAGE=train,DATASET_PATH=$PWD/examples/reference,UPDATES=20,LOG_EVERY=10,CHECKPOINT_EVERY=10 run_test40.pbs
 
 # 同じ学習を3万更新まで継続
 qsub -P <課題番号> -v RESUME=1,UPDATES=30000 run_test40.pbs
@@ -53,6 +72,10 @@ qsub -P <課題番号> -v RESUME=1,UPDATES=30000 run_test40.pbs
 qsub -P <課題番号> -v STAGE=generate,PHASE=glass run_test40.pbs
 qsub -P <課題番号> -v STAGE=generate,PHASE=crystal run_test40.pbs
 ```
+
+MD生成のレプリカ数は`NREP_CRYSTAL`/`NREP_GLASS`（既定5・5）、各軌跡の長さは`MD_NSTEPS`/`MD_DUMP_EVERY`/
+`MD_EQ_STEPS`（既定は2 ns、200 fs毎ダンプ、20 ps平衡化）で調整できます。`input/dataset`は既に
+存在すれば`STAGE=full`/`prepare`はスキップします（作り直す場合は削除してから実行してください）。
 
 リポジトリが非公開の場合はGitHub認証が必要です。GitHubにアクセスできない計算機では、
 認証済みの端末でcloneしたフォルダと作成済み `test40.sif` を転送してください。
@@ -206,5 +229,15 @@ python -m pytest -q
   `demo/demo_training/simu_data/sio2_3000_glass_0_1k_sample0.dat`。元のMIT noticeは `licenses/DM2-MIT.txt`。
 - Crystal: ユーザーのScoreMD作業ツリーの `md/silica_beta_cristobalite_init.data`。
   元のScoreMD MIT noticeは `licenses/ScoreMD-MIT.txt`。
+
+`md/`には、`STAGE=md`/`full`が実際のMD軌跡を生成するためのLAMMPS入力・参照構造も同梱しています
+（学習済み重みではなく、生成される`.lammpstrj`もリポジトリには含めません、`.gitignore`参照）:
+
+- `md/silica_beta_cristobalite.in` / `md/silica_beta_cristobalite_init.data`: ユーザーのScoreMD
+  作業ツリー由来（β-cristobalite 2×2×2、Vashishta SiO2、NPT production）。`licenses/ScoreMD-MIT.txt`。
+- `md/silica_glass_nvt.in`: 同じくScoreMD作業ツリー由来のNVT生成スクリプト（新規作成）。
+- `md/glass_seed.dat`: [DM2](https://github.com/digital-synthesis-lab/DM2), commit
+  `ab5a7e65d0879c5de23859fa191e318f9f70fae0`, `demo/demo_training/simu_data/sio2_3000_glass_100k_sample0.dat`
+  （NVT軌跡の開始構造1つ、`examples/reference`の同梱ガラスとは別サンプル）。`licenses/DM2-MIT.txt`。
 
 再配布時にもこれらのnoticeを保持してください。

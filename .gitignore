@@ -4,6 +4,9 @@ __pycache__/
 *.pt
 input/
 results/
+md/*.lammpstrj
+md/log.*
+md/glass_log.*
 *.o[0-9]*
 *.e[0-9]*
 .venv/

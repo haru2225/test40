@@ -1,12 +1,62 @@
 #!/usr/bin/env bash
 #PBS -q sg8
 #PBS -N test40_sio2
-#PBS -l walltime=20:00:00
+#PBS -l walltime=48:00:00
 #PBS -l select=1:ncpus=8:mpiprocs=1:ompthreads=8:mem=32gb:ngpus=1
 #PBS -j oe
 set -euo pipefail
 cd "${PBS_O_WORKDIR:-$(dirname "${BASH_SOURCE[0]}")}"
 work_dir="$(pwd -P)"
+stage="${STAGE:-full}"
+dataset="${DATASET_PATH:-$work_dir/input/dataset}"
+train_dir="${TRAIN_DIR:-$work_dir/results/train}"
+nrep_crystal="${NREP_CRYSTAL:-5}"
+nrep_glass="${NREP_GLASS:-5}"
+
+# --- MD stage: generate the LAMMPS trajectories `prepare` needs, if they
+# are not already there. This runs OUTSIDE the container (test40.sif has no
+# LAMMPS) with a bare `lmp`, so it needs its own module/binary, unlike
+# prepare/train/generate below. Site-specific: adjust for your cluster.
+run_md() {
+    module load lammps >/dev/null 2>&1 || true
+    local lmp_bin="${LMP_BIN:-lmp}"
+    : "${LAMMPS_POTENTIALS:?Set LAMMPS_POTENTIALS to the Vashishta potential directory for MD generation}"
+    local pids=()
+    local r seed extra_args
+    for ((r = 0; r < nrep_crystal; r++)); do
+        [[ -s "md/traj_${r}.lammpstrj" ]] && continue
+        seed=$((17 + 31 * r))
+        echo "[md] crystal replica $r (seed=$seed)" >&2
+        "$lmp_bin" -in md/silica_beta_cristobalite.in \
+            -var TEMP "${MD_TEMP:-300}" -var NSTEPS "${MD_NSTEPS:-2000000}" \
+            -var DUMP_EVERY "${MD_DUMP_EVERY:-200}" -var EQ_STEPS "${MD_EQ_STEPS:-20000}" \
+            -var SEED "$seed" -var REPLICA "$r" -log "md/log.${r}" &
+        pids+=($!)
+    done
+    for ((r = 0; r < nrep_glass; r++)); do
+        [[ -s "md/glass_traj_${r}.lammpstrj" ]] && continue
+        seed=$((1009 + 31 * r))
+        echo "[md] glass replica $r (seed=$seed)" >&2
+        extra_args=(-var INIT_DATA "${GLASS_INIT_DATA:-md/glass_seed.dat}")
+        "$lmp_bin" -in md/silica_glass_nvt.in \
+            -var TEMP "${MD_TEMP:-300}" -var NSTEPS "${MD_NSTEPS:-2000000}" \
+            -var DUMP_EVERY "${MD_DUMP_EVERY:-200}" -var EQ_STEPS "${MD_EQ_STEPS:-20000}" \
+            -var SEED "$seed" -var REPLICA "$r" "${extra_args[@]}" -log "md/glass_log.${r}" &
+        pids+=($!)
+    done
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        echo "[md] all $((nrep_crystal + nrep_glass)) replicas already present, skipping" >&2
+    else
+        wait "${pids[@]}"
+    fi
+}
+
+if [[ "$stage" == md ]]; then
+    run_md
+    exit 0
+fi
+
+# --- prepare/train/generate all run inside the container.
 runtime="${CONTAINER_RUNTIME:-singularity}"
 if ! command -v "$runtime" >/dev/null 2>&1 && command -v apptainer >/dev/null 2>&1; then
     runtime=apptainer
@@ -16,10 +66,42 @@ sif="${SIF_IMAGE:-$work_dir/test40.sif}"
 [[ -r "$sif" ]] || { echo "Missing container: $sif" >&2; exit 2; }
 bind_args=(--bind "$work_dir:$work_dir")
 if [[ -n "${EXTRA_BIND:-}" ]]; then bind_args+=(--bind "$EXTRA_BIND"); fi
-dataset="${DATASET_PATH:-$work_dir/examples/reference}"
-train_dir="${TRAIN_DIR:-$work_dir/results/train}"
-stage="${STAGE:-train}"
+
+run_prepare() {
+    if [[ -s "$dataset/metadata.json" ]]; then
+        echo "[prepare] dataset already present at $dataset, skipping" >&2
+        return 0
+    fi
+    local crystal_files=() glass_files=() r
+    for ((r = 0; r < nrep_crystal; r++)); do crystal_files+=("md/traj_${r}.lammpstrj"); done
+    for ((r = 0; r < nrep_glass; r++)); do glass_files+=("md/glass_traj_${r}.lammpstrj"); done
+    # Type order is fixed by the bundled source files: the crystal init data
+    # lists type 1=Si,2=O; the DM2 glass seed lists the reverse, 1=O,2=Si.
+    "$runtime" exec "${bind_args[@]}" --pwd "$work_dir" "$sif" \
+        python -u "$work_dir/test40.py" prepare \
+        --glass "${glass_files[@]}" --glass-input-format lammps-dump-text --glass-lammps-types 8 14 \
+        --glass-index "${PREPARE_GLASS_INDEX:-1000::300}" --allow-sharing-defects \
+        --crystal "${crystal_files[@]}" --crystal-input-format lammps-dump-text --crystal-lammps-types 14 8 \
+        --crystal-index "${PREPARE_CRYSTAL_INDEX:-1000::300}" --split-gap "${PREPARE_SPLIT_GAP:-5}" \
+        --output "$dataset"
+}
+
 case "$stage" in
+    full)
+        run_md
+        run_prepare
+        stage_run=train
+        ;;
+    prepare)
+        run_prepare
+        exit 0
+        ;;
+    train) stage_run=train ;;
+    generate) stage_run=generate ;;
+    *) echo 'STAGE must be full, md, prepare, train or generate' >&2; exit 2 ;;
+esac
+
+case "$stage_run" in
     train)
         args=(train --dataset "$dataset" --output "$train_dir"
               --updates "${UPDATES:-30000}" --width "${WIDTH:-64}" --layers "${LAYERS:-3}"
@@ -38,10 +120,18 @@ case "$stage" in
         # Default: the first training frame.
         if [[ -n "${FRAME:-}" ]]; then args+=(--frame "$FRAME"); fi
         ;;
-    *) echo 'STAGE must be train or generate' >&2; exit 2 ;;
 esac
+# Default time budget leaves headroom within the #PBS -l walltime above,
+# minus whatever this same job already spent on MD generation/prepare in
+# STAGE=full (so training checkpoints and exits cleanly, code 75, instead of
+# being walltime-killed mid-write). Keep WALLTIME_HOURS in sync with the
+# walltime header if you change it (or override with -l walltime=... on
+# qsub, which does not update this variable).
+walltime_hours="${WALLTIME_HOURS:-48}"
+default_budget=$(awk -v w="$walltime_hours" -v s="$SECONDS" \
+    'BEGIN { b = w - s / 3600 - 0.5; if (b < 0.1) b = 0.1; printf "%.2f", b }')
 args+=(--device cuda --seed "${SEED:-1337}" --checkpoint-every "${CHECKPOINT_EVERY:-100}"
-       --time-budget-hours "${TIME_BUDGET_HOURS:-19.5}")
+       --time-budget-hours "${TIME_BUDGET_HOURS:-$default_budget}")
 case "${RESUME:-0}" in 0) ;; 1) args+=(--resume) ;; *) echo 'RESUME must be 0 or 1' >&2; exit 2;; esac
 exec "$runtime" exec --nv "${bind_args[@]}" --pwd "$work_dir" \
     --env OMP_NUM_THREADS=8 --env MKL_NUM_THREADS=8 \
