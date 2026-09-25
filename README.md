@@ -5,10 +5,10 @@
 そのビーズ配置を学習します。生成は指定相の周期セル内の一様ランダム配置から開始します。
 
 学習済み・品質検証済みのモデルではなく、スパコンで学習・評価するための実装です。
-`examples/reference/`はガラス1構造・結晶1構造の**動作確認用データ**です。このデータでの検証lossは
-独立な構造への汎化を測りません。既定の`qsub run_test40.pbs`（`STAGE=full`）は、同梱のLAMMPS入力
-から結晶(NPT複数レプリカ)・ガラス(NVT複数レプリカ)の多フレーム軌跡を生成して`input/dataset`を
-作りますが、それでも汎化性能の保証にはなりません。多数の独立な参照構造を使った評価が必要です。
+`examples/reference/`はガラス1構造・結晶1構造の**動作確認用データ**で、このデータでの検証lossは
+独立な構造への汎化を測りません。既定の`qsub run_test40.pbs`（`STAGE=train`）が使う
+`examples/dm2-glass-crystal/`はガラス11構造・結晶62フレームで、より汎化を見込めますが、
+それでも十分な数とは言えず、性能の保証にはなりません。多数の独立な参照構造を使った評価が必要です。
 
 ## 粗視化の定義
 
@@ -37,13 +37,12 @@ R_i=r_{Si,i}+\frac{\sum_o(m_O/n_o)\,\Delta r_{i,o}}{M_i}.
 
 Python 3.11、PyTorch 2.6.0 / CUDA 12.4を基準にしています。PBSの既定値は既存の `sg8`、
 GPU 1台、CPU 8、メモリ32 GB、20時間です（他のジョブスクリプト同様、このリポジトリでは
-`sg8`キューの上限に合わせています）。`STAGE=full`はMD生成も同じ20時間枠に含むため、
-レプリカ数・ステップ数（`NREP_CRYSTAL`/`NREP_GLASS`/`MD_NSTEPS`など）が大きいと学習に
-残る時間が少なくなります。MD生成に時間がかかる場合は、先に`STAGE=md`だけを独立ジョブとして
-実行し（同じ20時間枠を使い切ってもよい。既に生成済みの軌跡は次回スキップされます）、
-完了後に`STAGE=full`（またはprepare→train）を投げ直してください。
-必要なモジュールは利用環境に合わせてロードしてください。
+`sg8`キューの上限に合わせています）。
 コンテナ作成は外部ネットワークに接続でき、Singularity/Apptainerのビルドを許可されたホストで実行します。
+
+**既定（`STAGE`未指定）は`STAGE=train`で、同梱の検証済みデータセット`examples/dm2-glass-crystal/`
+（glass 11フレーム・crystal 62フレーム）をそのまま学習します。** MD生成・LAMMPS・prepareは一切不要です
+（`STAGE=full`の自動glass生成は未検証のため既定にしていません。下記「同梱参照の出典」参照）。
 
 ```bash
 git clone git@github.com:haru2225/test40.git
@@ -51,34 +50,27 @@ cd test40
 singularity build test40.sif Singularity.def
 # Apptainerでも可: apptainer build test40.sif Singularity.def
 
-# 既定(STAGE=full)は1回のqsubで完結: 同梱のLAMMPS入力(md/*.in, md/glass_seed.dat)から
-# 結晶(NPT)・ガラス(NVT)の多フレーム軌跡を生成し(足りないレプリカのみ; 既にあればスキップ)、
-# input/dataset へprepareし、学習まで行います。LAMMPS(Vashishta potential)は
-# コンテナの外で動くので、run_test40.pbs内の「site-specific」ブロックで
-# 自サイトのLAMMPSモジュール名に書き換え、LAMMPS_POTENTIALSも指定してください。
-qsub -P <課題番号> -v LAMMPS_POTENTIALS=/path/to/vashishta/potentials run_test40.pbs
+# 既定(STAGE=train)で1回のqsubだけで学習開始。LAMMPS/DATASET_PATH指定は不要。
+qsub -P <課題番号> run_test40.pbs
 
-# 段階を分けたい場合はSTAGEで指定できます:
-#   STAGE=md      同梱LAMMPS入力から軌跡だけ生成（コンテナ不要）
-#   STAGE=prepare 既存の軌跡からinput/datasetをprepareするだけ
-#   STAGE=train   既存のinput/dataset（既定）で学習だけ
-#   STAGE=generate 生成のみ（下記）
-qsub -P <課題番号> -v STAGE=md,LAMMPS_POTENTIALS=/path/to/vashishta/potentials run_test40.pbs
-qsub -P <課題番号> -v STAGE=prepare run_test40.pbs
-
-# まず短いGPU動作確認（同梱の examples/reference を使う）。生成品質の検証ではありません。
-qsub -P <課題番号> -v STAGE=train,DATASET_PATH=$PWD/examples/reference,UPDATES=20,LOG_EVERY=10,CHECKPOINT_EVERY=10 run_test40.pbs
-
-# 検証済みの複数フレームデータセット(glass 11フレーム・crystal 62フレーム)で本番学習
-# (MD生成不要、STAGE=trainだけでよい: STAGE=fullのMD生成/prepareを経由しない)
-qsub -P <課題番号> -v STAGE=train,DATASET_PATH=$PWD/examples/dm2-glass-crystal run_test40.pbs
-
-# 同じ学習を3万更新まで継続
-qsub -P <課題番号> -v RESUME=1,DATASET_PATH=$PWD/examples/dm2-glass-crystal,UPDATES=30000 run_test40.pbs
+# 続きから3万更新まで継続（TRAIN_DIRは省略時同じ既定パスなので一致する）
+qsub -P <課題番号> -v RESUME=1,UPDATES=30000 run_test40.pbs
 
 # 学習ジョブが完了してから、それぞれ別ジョブで生成
 qsub -P <課題番号> -v STAGE=generate,PHASE=glass run_test40.pbs
 qsub -P <課題番号> -v STAGE=generate,PHASE=crystal run_test40.pbs
+```
+
+他の`STAGE`値も使えます（いずれも`DATASET_PATH`を明示すれば任意のデータセットに差し替え可能）:
+
+```bash
+# まず短いGPU動作確認（同梱の examples/reference、単一参照構造を使う）。生成品質の検証ではありません。
+qsub -P <課題番号> -v DATASET_PATH=$PWD/examples/reference,UPDATES=20,LOG_EVERY=10,CHECKPOINT_EVERY=10 run_test40.pbs
+
+# 同梱LAMMPS入力から軌跡を自前生成し、prepareし直したい場合（glass生成は未検証、下記参照）
+qsub -P <課題番号> -v STAGE=full,LAMMPS_POTENTIALS=/path/to/vashishta/potentials run_test40.pbs
+qsub -P <課題番号> -v STAGE=md,LAMMPS_POTENTIALS=/path/to/vashishta/potentials run_test40.pbs
+qsub -P <課題番号> -v STAGE=prepare run_test40.pbs
 ```
 
 MD生成のレプリカ数は`NREP_CRYSTAL`/`NREP_GLASS`（既定5・5）、各軌跡の長さは`MD_NSTEPS`/`MD_DUMP_EVERY`/
@@ -88,7 +80,7 @@ MD生成のレプリカ数は`NREP_CRYSTAL`/`NREP_GLASS`（既定5・5）、各�
 リポジトリが非公開の場合はGitHub認証が必要です。GitHubにアクセスできない計算機では、
 認証済みの端末でcloneしたフォルダと作成済み `test40.sif` を転送してください。
 
-既定の入力は同梱の `examples/reference/` です。生成系はガラス1000ビーズ、結晶64ビーズで、
+既定の入力は同梱の `examples/dm2-glass-crystal/` です。生成系はガラス1000ビーズ、結晶64ビーズで、
 参照相ごとのセルとビーズ数を使います。任意サイズ・任意密度への外挿をするCLIではありません。
 同じセルと組成の両相データを用意すれば、サイズ・密度の違いに頼らず相条件の効果を比較できます。
 

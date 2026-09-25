@@ -7,8 +7,18 @@
 set -euo pipefail
 cd "${PBS_O_WORKDIR:-$(dirname "${BASH_SOURCE[0]}")}"
 work_dir="$(pwd -P)"
-stage="${STAGE:-full}"
-dataset="${DATASET_PATH:-$work_dir/input/dataset}"
+stage="${STAGE:-train}"
+# Bare qsub (STAGE=train, the default) trains on examples/dm2-glass-crystal,
+# the bundled, training-validated multi-frame dataset (see README).
+# STAGE=full/prepare instead default to input/dataset, the location they
+# freshly build into -- overridable either way with DATASET_PATH.
+if [[ -n "${DATASET_PATH:-}" ]]; then
+    dataset="$DATASET_PATH"
+elif [[ "$stage" == train ]]; then
+    dataset="$work_dir/examples/dm2-glass-crystal"
+else
+    dataset="$work_dir/input/dataset"
+fi
 train_dir="${TRAIN_DIR:-$work_dir/results/train}"
 nrep_crystal="${NREP_CRYSTAL:-5}"
 nrep_glass="${NREP_GLASS:-5}"
