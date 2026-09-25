@@ -115,8 +115,8 @@ case "$stage_run" in
     train)
         args=(train --dataset "$dataset" --output "$train_dir"
               --updates "${UPDATES:-30000}" --batch-size "${BATCH_SIZE:-8}"
-              --width "${WIDTH:-64}" --layers "${LAYERS:-3}"
-              --cutoff "${CUTOFF:-5.0}" --sigma-min "${SIGMA_MIN:-0.03}"
+              --width "${WIDTH:-128}" --layers "${LAYERS:-5}"
+              --cutoff "${CUTOFF:-6.0}" --sigma-min "${SIGMA_MIN:-0.03}"
               --learning-rate "${LEARNING_RATE:-0.0002}" --log-every "${LOG_EVERY:-100}")
         if [[ -n "${SIGMA_MAX:-}" ]]; then args+=(--sigma-max "$SIGMA_MAX"); fi
         ;;

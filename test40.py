@@ -704,9 +704,14 @@ def parser():
     tr.add_argument("--dataset", type=Path, required=True)
     tr.add_argument("--updates", type=count, default=30000)
     tr.add_argument("--batch-size", type=count, default=8, help="(frame, sigma) samples averaged per phase before each backward")
-    tr.add_argument("--width", type=count, default=64)
-    tr.add_argument("--layers", type=count, default=3)
-    tr.add_argument("--cutoff", type=positive, default=5.)
+    tr.add_argument("--width", type=count, default=128)
+    tr.add_argument("--layers", type=count, default=5)
+    # Capped below 6.79 A (half the crystal cell's 13.57 A side, examples/
+    # dm2-glass-crystal's 2x2x2/64-bead supercell): 7-8 A would violate that
+    # and fail immediately (train() checks this against every frame's cell).
+    # Replicate the crystal reference to a bigger supercell first if a wider
+    # cutoff is needed.
+    tr.add_argument("--cutoff", type=positive, default=6.)
     tr.add_argument("--sigma-min", type=positive, default=0.03)
     tr.add_argument("--sigma-max", type=positive)
     tr.add_argument("--learning-rate", type=positive, default=2e-4)
