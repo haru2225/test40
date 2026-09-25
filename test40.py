@@ -293,12 +293,21 @@ class PhaseScore(nn.Module):
         box = sorted(float(x) for x in lengths)
         cond = disp.new_tensor([math.log(sigma), *[math.log(x) for x in box],
                                 math.log(len(types) / math.prod(box))])
-        # Re-added after every block: with only the initial injection, sigma
-        # and cell conditioning must survive 'layers' rounds of message
-        # passing undiluted, which requires the network to specifically
-        # preserve rather than overwrite that signal at every layer. Adding
-        # it back in is safe for equivariance here because h (unlike v) is a
-        # pure rotation-invariant scalar channel.
+        # Re-added after every block. DM2's own production model re-injects
+        # its condition embedding (cooling rate) after every conv layer this
+        # way; DM2 does not feed sigma to the network at all (only geometry),
+        # so this is not literally DM2's design ported over -- it applies
+        # the same layer-wise re-injection *pattern* (also present in DM2's
+        # code as NequIP_TimeEmbed, unused by DM2's own training script) to
+        # sigma instead, since sigma is the more central conditioning
+        # variable here (the target's character changes qualitatively with
+        # it, unlike DM2's cooling rate). This is an untested hypothesis, not
+        # a confirmed fix: with only the initial injection, sigma and cell
+        # conditioning must survive 'layers' rounds of message passing
+        # without the network being pushed to preserve it, but whether that
+        # actually degrades it in just 3 layers is unverified. Safe for
+        # equivariance regardless, since h (unlike v) is a pure
+        # rotation-invariant scalar channel.
         cond_embed = self.condition(cond)
         h = self.species(types) + self.phase.weight[phase] + cond_embed
         v = h.new_zeros((len(types), 3, h.shape[-1]))
