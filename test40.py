@@ -293,10 +293,18 @@ class PhaseScore(nn.Module):
         box = sorted(float(x) for x in lengths)
         cond = disp.new_tensor([math.log(sigma), *[math.log(x) for x in box],
                                 math.log(len(types) / math.prod(box))])
-        h = self.species(types) + self.phase.weight[phase] + self.condition(cond)
+        # Re-added after every block: with only the initial injection, sigma
+        # and cell conditioning must survive 'layers' rounds of message
+        # passing undiluted, which requires the network to specifically
+        # preserve rather than overwrite that signal at every layer. Adding
+        # it back in is safe for equivariance here because h (unlike v) is a
+        # pure rotation-invariant scalar channel.
+        cond_embed = self.condition(cond)
+        h = self.species(types) + self.phase.weight[phase] + cond_embed
         v = h.new_zeros((len(types), 3, h.shape[-1]))
         for block in self.blocks:
             h, v = block(h, v, i, j, unit, radial, envelope)
+            h = h + cond_embed
         return self.head(v).squeeze(-1)
 
 
