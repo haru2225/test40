@@ -345,7 +345,7 @@ def train(args):
         raise ValueError("sigma-max must exceed sigma-min and be large enough for a uniform terminal distribution")
     settings = dict(dataset_sha256=digest(args.dataset / "metadata.json"), architecture=config,
         sigma_min=args.sigma_min, sigma_max=sigma_max, learning_rate=args.learning_rate,
-        seed=args.seed, device=args.device)
+        batch_size=args.batch_size, seed=args.seed, device=args.device)
     output = output_dir(args.output, args.resume)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -389,14 +389,26 @@ def train(args):
         optimizer.zero_grad(set_to_none=True)
         losses = {}
         # Equal phase weight regardless of atom count or number of frames.
+        # Each step averages --batch-size independently noised (frame, sigma)
+        # samples per phase before backward: a single sample's gradient is a
+        # very high-variance estimate of the denoising-score-matching
+        # objective (the noise is redrawn fresh every call), which was
+        # confirmed to stall training indefinitely at some sigma scales even
+        # with a 50x higher learning rate; averaging several samples first
+        # is the standard mitigation and does not change what the loss
+        # estimates, only its variance.
         for phase in PHASES:
-            frame = int(np.random.choice(meta["phases"][phase]["train_ids"]))
-            sigma = math.exp(np.random.uniform(math.log(args.sigma_min), math.log(sigma_max)))
-            loss, _ = loss_for(phase, frame, sigma)
-            if not torch.isfinite(loss):
-                raise RuntimeError("Non-finite loss; last saved checkpoint is preserved")
-            (loss / 2).backward()
-            losses[phase] = float(loss.detach())
+            total = 0.
+            for _ in range(args.batch_size):
+                frame = int(np.random.choice(meta["phases"][phase]["train_ids"]))
+                sigma = math.exp(np.random.uniform(math.log(args.sigma_min), math.log(sigma_max)))
+                loss, _ = loss_for(phase, frame, sigma)
+                if not torch.isfinite(loss):
+                    raise RuntimeError("Non-finite loss; last saved checkpoint is preserved")
+                total = total + loss
+            total = total / args.batch_size
+            (total / 2).backward()
+            losses[phase] = float(total.detach())
         nn.utils.clip_grad_norm_(model.parameters(), 10, error_if_nonfinite=True)
         optimizer.step()
         completed = step
@@ -674,6 +686,7 @@ def parser():
     tr = sub.add_parser("train")
     tr.add_argument("--dataset", type=Path, required=True)
     tr.add_argument("--updates", type=count, default=30000)
+    tr.add_argument("--batch-size", type=count, default=8, help="(frame, sigma) samples averaged per phase before each backward")
     tr.add_argument("--width", type=count, default=64)
     tr.add_argument("--layers", type=count, default=3)
     tr.add_argument("--cutoff", type=positive, default=5.)
